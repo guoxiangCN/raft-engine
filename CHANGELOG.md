@@ -5,15 +5,18 @@
 ### Bug Fixes
 
 * Unconditionally tolerate `fallocate` failures as a fix to its portability issue. Errors other than `EOPNOTSUPP` will still emit a warning.
+* Avoid leaving fractured write after failure by reseeking the file writer. Panic if the reseek fails as well.
 
 ### New Features
 
 * Add `PerfContext` which records detailed time breakdown of the write process to thread-local storage.
+* Support recycling obsolete log files to reduce the cost of `fallocate`-ing new ones.
 
 ### Public API Changes
 
 * Add `is_empty` to `Engine` API.
 * Add metadata deletion capability to `FileSystem` trait. Users can implement `exists_metadata` and `delete_metadata` to clean up obsolete metadata from older versions of Raft Engine.
+* Add `Engine::scan_messages` and `Engine::scan_raw_messages` for iterating over written key-values. 
 
 ## [0.2.0] - 2022-05-25
 

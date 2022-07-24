@@ -232,6 +232,9 @@ impl Read for LogFile {
 
 impl Seek for LogFile {
     fn seek(&mut self, pos: SeekFrom) -> IoResult<u64> {
+        fail_point!("log_file::seek::err", |_| {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "fp"))
+        });
         match pos {
             SeekFrom::Start(offset) => self.offset = offset as usize,
             SeekFrom::Current(i) => self.offset = (self.offset as i64 + i) as usize,
@@ -274,6 +277,10 @@ impl FileSystem for DefaultFileSystem {
 
     fn delete<P: AsRef<Path>>(&self, path: P) -> IoResult<()> {
         std::fs::remove_file(path)
+    }
+
+    fn rename<P: AsRef<Path>>(&self, src_path: P, dst_path: P) -> IoResult<()> {
+        std::fs::rename(src_path, dst_path)
     }
 
     fn new_reader(&self, handle: Arc<Self::Handle>) -> IoResult<Self::Reader> {
