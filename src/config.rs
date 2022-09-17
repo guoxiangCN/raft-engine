@@ -9,7 +9,7 @@ use crate::{util::ReadableSize, Result};
 const MIN_RECOVERY_READ_BLOCK_SIZE: usize = 512;
 const MIN_RECOVERY_THREADS: usize = 1;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RecoveryMode {
     AbsoluteConsistency,
@@ -37,7 +37,7 @@ pub struct Config {
     pub recovery_mode: RecoveryMode,
     /// Minimum I/O size for reading log files during recovery.
     ///
-    /// Default: "4KB". Minimum: "512B".
+    /// Default: "16KB". Minimum: "512B".
     pub recovery_read_block_size: ReadableSize,
     /// The number of threads used to scan and recovery log files.
     ///
@@ -49,15 +49,16 @@ pub struct Config {
     ///
     /// Default: "8KB"
     pub batch_compression_threshold: ReadableSize,
+    /// Deprecated.
     /// Incrementally sync log files after specified bytes have been written.
     /// Setting it to zero disables incremental sync.
     ///
     /// Default: "4MB"
-    pub bytes_per_sync: ReadableSize,
+    pub bytes_per_sync: Option<ReadableSize>,
 
     /// Version of the log file.
     ///
-    /// Default: 1
+    /// Default: 2
     pub format_version: Version,
 
     /// Target file size for rotating log files.
@@ -84,12 +85,11 @@ pub struct Config {
     /// Default: None
     pub memory_limit: Option<ReadableSize>,
 
-    /// Whether to recycle stale logs.
-    /// If `true`, `purge` operations on logs will firstly put stale
-    /// files into a list for recycle. It's only available if
-    /// `format_version` >= `2`.
+    /// Whether to recycle stale log files.
+    /// If `true`, logically purged log files will be reserved for recycling.
+    /// Only available for `format_version` 2 and above.
     ///
-    /// Default: false,
+    /// Default: true
     pub enable_log_recycle: bool,
 }
 
@@ -102,19 +102,20 @@ impl Default for Config {
             recovery_read_block_size: ReadableSize::kb(16),
             recovery_threads: 4,
             batch_compression_threshold: ReadableSize::kb(8),
-            bytes_per_sync: ReadableSize::mb(4),
-            format_version: Version::V1,
+            bytes_per_sync: None,
+            format_version: Version::V2,
             target_file_size: ReadableSize::mb(128),
             purge_threshold: ReadableSize::gb(10),
             purge_rewrite_threshold: None,
             purge_rewrite_garbage_ratio: 0.6,
             memory_limit: None,
-            enable_log_recycle: false,
+            enable_log_recycle: true,
         };
         // Test-specific configurations.
         #[cfg(test)]
         {
             cfg.memory_limit = Some(ReadableSize(0));
+            cfg.enable_log_recycle = true;
         }
         cfg
     }
@@ -131,8 +132,8 @@ impl Config {
                 self.target_file_size.0,
             )));
         }
-        if self.bytes_per_sync.0 == 0 {
-            self.bytes_per_sync = ReadableSize(u64::MAX);
+        if self.bytes_per_sync.is_some() {
+            warn!("bytes-per-sync has been deprecated.");
         }
         let min_recovery_read_block_size = ReadableSize(MIN_RECOVERY_READ_BLOCK_SIZE as u64);
         if self.recovery_read_block_size < min_recovery_read_block_size {
@@ -149,22 +150,15 @@ impl Config {
             );
             self.recovery_threads = MIN_RECOVERY_THREADS;
         }
-        if self.enable_log_recycle {
-            if !self.format_version.has_log_signing() {
-                return Err(box_err!(
-                    "format_version: {:?} is invalid when 'enable_log_recycle' on, setting it to V2",
-                    self.format_version
-                ));
-            }
-            if self.purge_threshold.0 / self.target_file_size.0 >= std::u32::MAX as u64 {
-                return Err(box_err!(
-                    "File count exceed UINT32_MAX, calculated by 'purge-threshold / target-file-size'"
-                ));
-            }
+        if self.enable_log_recycle && !self.format_version.has_log_signing() {
+            return Err(box_err!(
+                "format version {} doesn't support log recycle, use 2 or above",
+                self.format_version
+            ));
         }
         #[cfg(not(feature = "swap"))]
         if self.memory_limit.is_some() {
-            warn!("memory-limit will be ignored because swap feature is not enabled");
+            warn!("memory-limit will be ignored because swap feature is disabled");
         }
         Ok(())
     }
@@ -178,7 +172,11 @@ impl Config {
             return 0;
         }
         if self.enable_log_recycle && self.purge_threshold.0 >= self.target_file_size.0 {
-            (self.purge_threshold.0 / self.target_file_size.0) as usize
+            // This is required to squeeze file signature into an u32.
+            std::cmp::min(
+                (self.purge_threshold.0 / self.target_file_size.0) as usize,
+                u32::MAX as usize,
+            )
         } else {
             0
         }
@@ -206,15 +204,16 @@ mod tests {
             target-file-size = "1MB"
             purge-threshold = "3MB"
             format-version = 1
+            enable-log-recycle = false
         "#;
-        let load: Config = toml::from_str(custom).unwrap();
+        let mut load: Config = toml::from_str(custom).unwrap();
         assert_eq!(load.dir, "custom_dir");
         assert_eq!(load.recovery_mode, RecoveryMode::TolerateTailCorruption);
-        assert_eq!(load.bytes_per_sync, ReadableSize::kb(2));
+        assert_eq!(load.bytes_per_sync, Some(ReadableSize::kb(2)));
         assert_eq!(load.target_file_size, ReadableSize::mb(1));
         assert_eq!(load.purge_threshold, ReadableSize::mb(3));
         assert_eq!(load.format_version, Version::V1);
-        assert!(!load.enable_log_recycle);
+        load.sanitize().unwrap();
     }
 
     #[test]
@@ -229,7 +228,6 @@ mod tests {
         let soft_error = r#"
             recovery-read-block-size = "1KB"
             recovery-threads = 0
-            bytes-per-sync = "0KB"
             target-file-size = "5000MB"
             format-version = 2
             enable-log-recycle = true
@@ -239,7 +237,6 @@ mod tests {
         soft_sanitized.sanitize().unwrap();
         assert!(soft_sanitized.recovery_read_block_size.0 >= MIN_RECOVERY_READ_BLOCK_SIZE as u64);
         assert!(soft_sanitized.recovery_threads >= MIN_RECOVERY_THREADS);
-        assert_eq!(soft_sanitized.bytes_per_sync.0, u64::MAX);
         assert_eq!(
             soft_sanitized.purge_rewrite_threshold.unwrap(),
             soft_sanitized.target_file_size
@@ -247,20 +244,12 @@ mod tests {
         assert_eq!(soft_sanitized.format_version, Version::V2);
         assert!(soft_sanitized.enable_log_recycle);
 
-        let format_error = r#"
+        let recycle_error = r#"
             enable-log-recycle = true
+            format-version = 1
         "#;
-        let mut cfg_load: Config = toml::from_str(format_error).unwrap();
+        let mut cfg_load: Config = toml::from_str(recycle_error).unwrap();
         assert!(cfg_load.sanitize().is_err());
-
-        let file_count_error = r#"
-            target-file-size = "1B"
-            purge-threshold = "4GB"
-            format-version = 2
-            enable-log-recycle = true
-        "#;
-        let mut file_count_load: Config = toml::from_str(file_count_error).unwrap();
-        assert!(file_count_load.sanitize().is_err());
     }
 
     #[test]

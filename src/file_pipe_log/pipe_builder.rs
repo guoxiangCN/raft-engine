@@ -16,13 +16,13 @@ use crate::config::{Config, RecoveryMode};
 use crate::env::FileSystem;
 use crate::event_listener::EventListener;
 use crate::log_batch::LogItemBatch;
-use crate::pipe_log::{FileId, FileSeq, LogFileContext, LogQueue, Version};
+use crate::pipe_log::{FileId, FileSeq, LogQueue};
 use crate::util::Factory;
 use crate::{Error, Result};
 
 use super::format::{lock_file_path, FileNameExt, LogFileFormat};
-use super::log_file::{build_file_reader, FileHandler};
-use super::pipe::{DualPipes, SinglePipe};
+use super::log_file::build_file_reader;
+use super::pipe::{DualPipes, FileWithFormat, SinglePipe};
 use super::reader::LogItemBatchFileReader;
 use crate::env::Handle;
 
@@ -66,7 +66,7 @@ pub struct RecoveryConfig {
 struct FileToRecover<F: FileSystem> {
     seq: FileSeq,
     handle: Arc<F::Handle>,
-    version: Option<Version>,
+    format: Option<LogFileFormat>,
 }
 
 /// [`DualPipes`] factory that can also recover other customized memory states.
@@ -198,7 +198,7 @@ impl<F: FileSystem> DualPipesBuilder<F> {
                         files.push(FileToRecover {
                             seq,
                             handle,
-                            version: None,
+                            format: None,
                         });
                     }
                 }
@@ -228,7 +228,6 @@ impl<F: FileSystem> DualPipesBuilder<F> {
                 }
                 _ => (threads, threads),
             };
-
         let append_recovery_cfg = RecoveryConfig {
             queue: LogQueue::Append,
             mode: self.cfg.recovery_mode,
@@ -243,8 +242,8 @@ impl<F: FileSystem> DualPipesBuilder<F> {
         let append_files = &mut self.append_files;
         let rewrite_files = &mut self.rewrite_files;
         let file_system = self.file_system.clone();
-        // As the `recover_queue` would update the `Version` of each log file in
-        // `apend_files` and `rewrite_files`, we re-design the implementation on
+        // As the `recover_queue` would update the `LogFileFormat` of each log file
+        // in `apend_files` and `rewrite_files`, we re-design the implementation on
         // `recover_queue` to make it compatiable to concurrent processing
         // with ThreadPool.
         let (append, rewrite) = pool.join(
@@ -298,18 +297,19 @@ impl<F: FileSystem> DualPipesBuilder<F> {
                 let file_count = chunk.len();
                 for (i, f) in chunk.iter_mut().enumerate() {
                     let is_last_file = index == chunk_count - 1 && i == file_count - 1;
-                    match build_file_reader(file_system.as_ref(), f.handle.clone(), None) {
+                    let mut file_reader = build_file_reader(file_system.as_ref(), f.handle.clone())?;
+                    match file_reader.parse_format() {
                         Err(e) => {
-                            let is_local_tail = f.handle.file_size()? <= LogFileFormat::len();
+                            // TODO: More reliable tail detection.
                             if recovery_mode == RecoveryMode::TolerateAnyCorruption
                               || recovery_mode == RecoveryMode::TolerateTailCorruption
-                                && is_last_file && is_local_tail {
+                                && is_last_file {
                                 warn!(
                                     "File header is corrupted but ignored: {:?}:{}, {}",
                                     queue, f.seq, e
                                 );
                                 f.handle.truncate(0)?;
-                                f.version = Some(Version::default());
+                                f.format = Some(LogFileFormat::default());
                                 continue;
                             } else {
                                 error!(
@@ -319,12 +319,11 @@ impl<F: FileSystem> DualPipesBuilder<F> {
                                 return Err(e);
                             }
                         },
-                        Ok(file_reader) => {
-                            reader.open(FileId { queue, seq: f.seq }, file_reader)?;
+                        Ok(format) => {
+                            f.format = Some(format);
+                            reader.open(FileId { queue, seq: f.seq }, format, file_reader)?;
                         }
                     }
-                    // Update file version of each log file.
-                    f.version = Some(reader.file_format().unwrap().version());
                     loop {
                         match reader.next() {
                             Ok(Some(item_batch)) => {
@@ -404,11 +403,11 @@ impl<F: FileSystem> DualPipesBuilder<F> {
             LogQueue::Rewrite => &self.rewrite_files,
         };
         let first_seq = files.first().map(|f| f.seq).unwrap_or(0);
-        let files: VecDeque<FileHandler<F>> = files
+        let files: VecDeque<FileWithFormat<F>> = files
             .iter()
-            .map(|f| FileHandler {
+            .map(|f| FileWithFormat {
                 handle: f.handle.clone(),
-                context: LogFileContext::new(FileId { seq: f.seq, queue }, f.version.unwrap()),
+                format: f.format.unwrap(),
             })
             .collect();
         SinglePipe::open(

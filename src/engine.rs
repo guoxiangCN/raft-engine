@@ -136,8 +136,12 @@ where
     /// bytes. If `sync` is true, the write will be followed by a call to
     /// `fdatasync` on the log file.
     pub fn write(&self, log_batch: &mut LogBatch, mut sync: bool) -> Result<usize> {
+        if log_batch.is_empty() {
+            return Ok(0);
+        }
         let start = Instant::now();
         let len = log_batch.finish_populate(self.cfg.batch_compression_threshold.0 as usize)?;
+        debug_assert!(len > 0);
         let block_handle = {
             let mut writer = Writer::new(log_batch, sync);
             // Snapshot and clear the current perf context temporarily, so the write group
@@ -147,35 +151,18 @@ where
             if let Some(mut group) = self.write_barrier.enter(&mut writer) {
                 let now = Instant::now();
                 let _t = StopWatch::new_with(&*ENGINE_WRITE_LEADER_DURATION_HISTOGRAM, now);
-                let file_context = self.pipe_log.fetch_active_file(LogQueue::Append);
                 for writer in group.iter_mut() {
                     writer.entered_time = Some(now);
                     sync |= writer.sync;
-                    let log_batch = writer.get_mut_payload();
-                    let res = if !log_batch.is_empty() {
-                        log_batch.prepare_write(&file_context)?;
-                        self.pipe_log
-                            .append(LogQueue::Append, log_batch.encoded_bytes())
-                    } else {
-                        // TODO(tabokie): use Option<FileBlockHandle> instead.
-                        Ok(FileBlockHandle {
-                            id: FileId::new(LogQueue::Append, 0),
-                            offset: 0,
-                            len: 0,
-                        })
-                    };
+                    let log_batch = writer.mut_payload();
+                    let res = self.pipe_log.append(LogQueue::Append, log_batch);
                     writer.set_output(res);
                 }
-                debug_assert!(
-                    file_context.id == self.pipe_log.fetch_active_file(LogQueue::Append).id
-                );
                 perf_context!(log_write_duration).observe_since(now);
-                if let Err(e) = self.pipe_log.maybe_sync(LogQueue::Append, sync) {
-                    panic!(
-                        "Cannot sync {:?} queue due to IO error: {}",
-                        LogQueue::Append,
-                        e
-                    );
+                if sync {
+                    // As per trait protocol, this error should be retriable. But we panic anyway to
+                    // save the trouble of propagating it to other group members.
+                    self.pipe_log.sync(LogQueue::Append).expect("pipe::sync()");
                 }
                 // Pass the perf context diff to all the writers.
                 let diff = get_perf_context();
@@ -193,20 +180,17 @@ where
             set_perf_context(perf_context);
             writer.finish()?
         };
-
         let mut now = Instant::now();
-        if len > 0 {
-            log_batch.finish_write(block_handle);
-            self.memtables.apply_append_writes(log_batch.drain());
-            for listener in &self.listeners {
-                listener.post_apply_memtables(block_handle.id);
-            }
-            let end = Instant::now();
-            let apply_duration = end.saturating_duration_since(now);
-            ENGINE_WRITE_APPLY_DURATION_HISTOGRAM.observe(apply_duration.as_secs_f64());
-            perf_context!(apply_duration).observe(apply_duration);
-            now = end;
+        log_batch.finish_write(block_handle);
+        self.memtables.apply_append_writes(log_batch.drain());
+        for listener in &self.listeners {
+            listener.post_apply_memtables(block_handle.id);
         }
+        let end = Instant::now();
+        let apply_duration = end.saturating_duration_since(now);
+        ENGINE_WRITE_APPLY_DURATION_HISTOGRAM.observe(apply_duration.as_secs_f64());
+        perf_context!(apply_duration).observe(apply_duration);
+        now = end;
         ENGINE_WRITE_DURATION_HISTOGRAM.observe(now.saturating_duration_since(start).as_secs_f64());
         ENGINE_WRITE_SIZE_HISTOGRAM.observe(len as f64);
         Ok(len)
@@ -228,27 +212,39 @@ where
         Ok(None)
     }
 
+    pub fn get(&self, region_id: u64, key: &[u8]) -> Option<Vec<u8>> {
+        let _t = StopWatch::new(&*ENGINE_READ_MESSAGE_DURATION_HISTOGRAM);
+        if let Some(memtable) = self.memtables.get(region_id) {
+            return memtable.read().get(key);
+        }
+        None
+    }
+
+    /// Iterates over [start_key, end_key) range of Raft Group key-values and
+    /// yields messages of the required type. Unparsable items are skipped.
     pub fn scan_messages<S, C>(
         &self,
         region_id: u64,
         start_key: Option<&[u8]>,
         end_key: Option<&[u8]>,
         reverse: bool,
-        callback: C,
+        mut callback: C,
     ) -> Result<()>
     where
         S: Message,
         C: FnMut(&[u8], S) -> bool,
     {
-        let _t = StopWatch::new(&*ENGINE_READ_MESSAGE_DURATION_HISTOGRAM);
-        if let Some(memtable) = self.memtables.get(region_id) {
-            memtable
-                .read()
-                .scan_messages(start_key, end_key, reverse, callback)?;
-        }
-        Ok(())
+        self.scan_raw_messages(region_id, start_key, end_key, reverse, move |k, raw_v| {
+            if let Ok(v) = parse_from_bytes(raw_v) {
+                callback(k, v)
+            } else {
+                true
+            }
+        })
     }
 
+    /// Iterates over [start_key, end_key) range of Raft Group key-values and
+    /// yields all key value pairs as bytes.
     pub fn scan_raw_messages<C>(
         &self,
         region_id: u64,
@@ -264,7 +260,7 @@ where
         if let Some(memtable) = self.memtables.get(region_id) {
             memtable
                 .read()
-                .scan_raw_messages(start_key, end_key, reverse, callback)?;
+                .scan(start_key, end_key, reverse, callback)?;
         }
         Ok(())
     }
@@ -361,8 +357,8 @@ where
         self.memtables.is_empty()
     }
 
-    /// Returns the range of sequence number of `active` files of the
-    /// specific `LogQueue`.
+    /// Returns the sequence number range of active log files in the specific
+    /// log queue.
     /// For testing only.
     pub fn file_span(&self, queue: LogQueue) -> (u64, u64) {
         self.pipe_log.file_span(queue)
@@ -621,15 +617,6 @@ mod tests {
             }
         }
 
-        fn get(&self, rid: u64, key: &[u8]) -> Option<Vec<u8>> {
-            if let Some(memtable) = self.memtables.get(rid) {
-                if let Some(value) = memtable.read().get(key) {
-                    return Some(value);
-                }
-            }
-            None
-        }
-
         fn clean(&self, rid: u64) {
             let mut log_batch = LogBatch::default();
             log_batch.add_command(rid, Command::Clean);
@@ -831,6 +818,99 @@ mod tests {
     }
 
     #[test]
+    fn test_key_value_scan() {
+        fn key(i: u64) -> Vec<u8> {
+            format!("k{}", i).as_bytes().to_vec()
+        }
+        fn value(i: u64) -> Vec<u8> {
+            format!("v{}", i).as_bytes().to_vec()
+        }
+        fn rich_value(i: u64) -> RaftLocalState {
+            RaftLocalState {
+                last_index: i,
+                ..Default::default()
+            }
+        }
+
+        let dir = tempfile::Builder::new()
+            .prefix("test_key_value_scan")
+            .tempdir()
+            .unwrap();
+        let cfg = Config {
+            dir: dir.path().to_str().unwrap().to_owned(),
+            target_file_size: ReadableSize(1),
+            ..Default::default()
+        };
+        let rid = 1;
+        let engine =
+            RaftLogEngine::open_with_file_system(cfg, Arc::new(ObfuscatedFileSystem::default()))
+                .unwrap();
+
+        engine
+            .scan_messages::<RaftLocalState, _>(rid, None, None, false, |_, _| {
+                panic!("unexpected message.");
+            })
+            .unwrap();
+
+        let mut batch = LogBatch::default();
+        let mut res = Vec::new();
+        let mut rich_res = Vec::new();
+        batch.put(rid, key(1), value(1));
+        batch.put(rid, key(2), value(2));
+        batch.put(rid, key(3), value(3));
+        engine.write(&mut batch, false).unwrap();
+
+        engine
+            .scan_raw_messages(rid, None, None, false, |k, v| {
+                res.push((k.to_vec(), v.to_vec()));
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            res,
+            vec![(key(1), value(1)), (key(2), value(2)), (key(3), value(3))]
+        );
+        res.clear();
+        engine
+            .scan_raw_messages(rid, None, None, true, |k, v| {
+                res.push((k.to_vec(), v.to_vec()));
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            res,
+            vec![(key(3), value(3)), (key(2), value(2)), (key(1), value(1))]
+        );
+        res.clear();
+        engine
+            .scan_messages::<RaftLocalState, _>(rid, None, None, false, |_, _| {
+                panic!("unexpected message.")
+            })
+            .unwrap();
+
+        batch.put_message(rid, key(22), &rich_value(22)).unwrap();
+        batch.put_message(rid, key(33), &rich_value(33)).unwrap();
+        engine.write(&mut batch, false).unwrap();
+
+        engine
+            .scan_messages(rid, None, None, false, |k, v| {
+                rich_res.push((k.to_vec(), v));
+                false
+            })
+            .unwrap();
+        assert_eq!(rich_res, vec![(key(22), rich_value(22))]);
+        rich_res.clear();
+        engine
+            .scan_messages(rid, None, None, true, |k, v| {
+                rich_res.push((k.to_vec(), v));
+                false
+            })
+            .unwrap();
+        assert_eq!(rich_res, vec![(key(33), rich_value(33))]);
+        rich_res.clear();
+    }
+
+    #[test]
     fn test_delete_key_value() {
         let dir = tempfile::Builder::new()
             .prefix("test_delete_key_value")
@@ -851,16 +931,28 @@ mod tests {
         let mut delete_batch = LogBatch::default();
         delete_batch.delete(rid, key.clone());
 
-        // put | delete
-        //     ^ rewrite
         let engine =
             RaftLogEngine::open_with_file_system(cfg, Arc::new(ObfuscatedFileSystem::default()))
                 .unwrap();
+        assert_eq!(
+            engine.get_message::<RaftLocalState>(rid, &key).unwrap(),
+            None
+        );
+        assert_eq!(engine.get(rid, &key), None);
+
+        // put | delete
+        //     ^ rewrite
         engine.write(&mut batch_1.clone(), true).unwrap();
+        assert!(engine.get_message::<RaftLocalState>(rid, &key).is_err());
         engine.purge_manager.must_rewrite_append_queue(None, None);
         engine.write(&mut delete_batch.clone(), true).unwrap();
         let engine = engine.reopen();
         assert_eq!(engine.get(rid, &key), None);
+        assert_eq!(
+            engine.get_message::<RaftLocalState>(rid, &key).unwrap(),
+            None
+        );
+
         // Incomplete purge.
         engine.write(&mut batch_1.clone(), true).unwrap();
         engine
@@ -917,14 +1009,6 @@ mod tests {
         engine.write(&mut batch_2.clone(), true).unwrap();
         let engine = engine.reopen();
         assert_eq!(engine.get(rid, &key).unwrap(), v2);
-        let mut res = vec![];
-        engine
-            .scan_raw_messages(rid, Some(&key), None, false, |key, value| {
-                res.push((key.to_vec(), value.to_vec()));
-                true
-            })
-            .unwrap();
-        assert_eq!(res, vec![(key.clone(), v2.clone())]);
 
         // put | delete | put |
         //                    ^ rewrite
@@ -1158,8 +1242,12 @@ mod tests {
             check_purge(vec![1, 2, 3]);
         }
 
-        // 10th, rewrited
-        check_purge(vec![]);
+        // 10th, rewritten, but still needs to be compacted.
+        check_purge(vec![1, 2, 3]);
+        for rid in 1..=3 {
+            let memtable = engine.memtables.get(rid).unwrap();
+            assert_eq!(memtable.read().rewrite_count(), 50);
+        }
 
         // compact and write some new data to trigger compact again.
         for rid in 2..=50 {
@@ -1298,6 +1386,34 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_batch() {
+        let dir = tempfile::Builder::new()
+            .prefix("test_empty_batch")
+            .tempdir()
+            .unwrap();
+        let cfg = Config {
+            dir: dir.path().to_str().unwrap().to_owned(),
+            ..Default::default()
+        };
+        let engine =
+            RaftLogEngine::open_with_file_system(cfg, Arc::new(ObfuscatedFileSystem::default()))
+                .unwrap();
+        let data = vec![b'x'; 16];
+        let cases = [[false, false], [false, true], [true, true]];
+        for (i, writes) in cases.iter().enumerate() {
+            let rid = i as u64;
+            let mut batch = LogBatch::default();
+            for &has_data in writes {
+                if has_data {
+                    batch.put(rid, b"key".to_vec(), data.clone());
+                }
+                engine.write(&mut batch, true).unwrap();
+                assert!(batch.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn test_dirty_recovery() {
         let dir = tempfile::Builder::new()
             .prefix("test_dirty_recovery")
@@ -1354,7 +1470,7 @@ mod tests {
         assert_eq!(engine.file_span(LogQueue::Append).0, old_active_file + 1);
         let old_active_file = engine.file_span(LogQueue::Rewrite).1;
         engine.purge_manager.must_rewrite_rewrite_queue();
-        assert_eq!(engine.file_span(LogQueue::Rewrite).0, old_active_file + 1);
+        assert!(engine.file_span(LogQueue::Rewrite).0 > old_active_file);
 
         let engine = engine.reopen();
         for rid in 1..=3 {
@@ -1898,76 +2014,6 @@ mod tests {
     }
 
     #[test]
-    fn test_filesystem_move_file() {
-        use std::io::{Read, Write};
-
-        let dir = tempfile::Builder::new()
-            .prefix("test_filesystem_move_file")
-            .tempdir()
-            .unwrap();
-        let path = dir.path().to_str().unwrap();
-        let entry_data = vec![b'x'; 128];
-        let fs = Arc::new(DeleteMonitoredFileSystem::new());
-        // Move file from src to dst by `rename`
-        {
-            let src_file_id = FileId {
-                seq: 12,
-                queue: LogQueue::Append,
-            };
-            let dst_file_id = FileId {
-                seq: src_file_id.seq + 1,
-                ..src_file_id
-            };
-            let src_path = src_file_id.build_file_path(path); // src filepath
-            let dst_path = dst_file_id.build_file_path(path); // dst filepath
-            {
-                // Create file and write data with DeleteMonitoredFileSystem
-                let fd = Arc::new(fs.create(&src_file_id.build_file_path(path)).unwrap());
-                let mut writer = fs.new_writer(fd).unwrap();
-                writer.write_all(&entry_data[..]).unwrap();
-            }
-            fs.rename(&src_path, &dst_path).unwrap();
-            {
-                // Reopen the file and check data
-                let mut buf = vec![0; 1024];
-                let fd = Arc::new(fs.open(&dst_file_id.build_file_path(path)).unwrap());
-                let mut new_reader = fs.new_reader(fd).unwrap();
-                let actual_len = new_reader.read(&mut buf[..]).unwrap();
-                assert_eq!(actual_len, 1);
-                assert!(buf[0] == entry_data[0]);
-            }
-        }
-        // Move file from src to dst by `reuse`
-        {
-            let src_file_id = FileId {
-                seq: 14,
-                queue: LogQueue::Append,
-            };
-            let dst_file_id = FileId {
-                seq: src_file_id.seq + 1,
-                ..src_file_id
-            };
-            let src_path = src_file_id.build_file_path(path); // src filepath
-            let dst_path = dst_file_id.build_file_path(path); // dst filepath
-            {
-                // Create file and write data with DeleteMonitoredFileSystem
-                let fd = Arc::new(fs.create(&src_file_id.build_file_path(path)).unwrap());
-                let mut writer = fs.new_writer(fd).unwrap();
-                writer.write_all(&entry_data[..]).unwrap();
-            }
-            fs.reuse(&src_path, &dst_path).unwrap();
-            {
-                // Reopen the file and check whether the file is empty
-                let mut buf = vec![0; 1024];
-                let fd = Arc::new(fs.open(&dst_file_id.build_file_path(path)).unwrap());
-                let mut new_reader = fs.new_reader(fd).unwrap();
-                let actual_len = new_reader.read(&mut buf[..]).unwrap();
-                assert_eq!(actual_len, 0);
-            }
-        }
-    }
-
-    #[test]
     fn test_managed_file_deletion() {
         let dir = tempfile::Builder::new()
             .prefix("test_managed_file_deletion")
@@ -2140,6 +2186,7 @@ mod tests {
             target_file_size: ReadableSize(1),
             purge_threshold: ReadableSize(1024),
             format_version: Version::V1,
+            enable_log_recycle: false,
             ..Default::default()
         };
         let cfg_v2 = Config {
@@ -2150,6 +2197,7 @@ mod tests {
             enable_log_recycle: true,
             ..Default::default()
         };
+        assert_eq!(cfg_v2.recycle_capacity(), 15);
         // Prepare files with format_version V1
         {
             let engine = RaftLogEngine::open_with_file_system(cfg_v1.clone(), fs.clone()).unwrap();
@@ -2165,9 +2213,7 @@ mod tests {
                 engine.append(rid, 11, 20, Some(&entry_data));
             }
             // Mark region_id -> 6 obsolete.
-            for rid in 6..=6 {
-                engine.clean(rid);
-            }
+            engine.clean(6);
             // the [1, 12] files are recycled
             engine.purge_expired_files().unwrap();
             assert_eq!(engine.file_count(Some(LogQueue::Append)), 5);

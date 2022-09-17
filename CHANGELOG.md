@@ -1,11 +1,13 @@
 # Raft Engine Change Log
 
-## [Unreleased]
+## [0.3.0] - 2022-09-14
 
 ### Bug Fixes
 
 * Unconditionally tolerate `fallocate` failures as a fix to its portability issue. Errors other than `EOPNOTSUPP` will still emit a warning.
 * Avoid leaving fractured write after failure by reseeking the file writer. Panic if the reseek fails as well.
+* Fix a parallel recovery panic bug.
+* Fix panic when an empty batch is written to engine and then reused.
 
 ### New Features
 
@@ -17,6 +19,14 @@
 * Add `is_empty` to `Engine` API.
 * Add metadata deletion capability to `FileSystem` trait. Users can implement `exists_metadata` and `delete_metadata` to clean up obsolete metadata from older versions of Raft Engine.
 * Add `Engine::scan_messages` and `Engine::scan_raw_messages` for iterating over written key-values. 
+* Add `Engine::get` for getting raw value.
+* Move `sync` from `env::WriteExt` to `env::Handle`.
+* Deprecate `bytes_per_sync`.
+
+### Behavior Changes
+
+* Change format version to 2 from 1 by default.
+* Enable log recycling by default.
 
 ## [0.2.0] - 2022-05-25
 

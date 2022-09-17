@@ -24,10 +24,8 @@ pub trait FileSystem: Send + Sync {
 
     fn rename<P: AsRef<Path>>(&self, src_path: P, dst_path: P) -> Result<()>;
 
-    /// Reuse the old `src_path` with new `dst_path` filepath.
-    ///
-    /// It's an open interface for user-defined implementation.
-    /// Default implemented by `self.rename(...)`.
+    /// Reuses file at `src_path` as a new file at `dst_path`. The default
+    /// implementation simply renames the file.
     fn reuse<P: AsRef<Path>>(&self, src_path: P, dst_path: P) -> Result<()> {
         self.rename(src_path, dst_path)
     }
@@ -58,11 +56,12 @@ pub trait Handle {
 
     /// Returns the current size of this file.
     fn file_size(&self) -> Result<usize>;
+
+    fn sync(&self) -> Result<()>;
 }
 
 /// WriteExt is writer extension api
 pub trait WriteExt {
     fn truncate(&mut self, offset: usize) -> Result<()>;
-    fn sync(&mut self) -> Result<()>;
     fn allocate(&mut self, offset: usize, size: usize) -> Result<()>;
 }

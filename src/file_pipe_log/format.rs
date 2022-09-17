@@ -20,6 +20,20 @@ const LOG_REWRITE_SUFFIX: &str = ".rewrite";
 /// File header.
 const LOG_FILE_MAGIC_HEADER: &[u8] = b"RAFT-LOG-FILE-HEADER-9986AB3E47F320B394C8E84916EB0ED5";
 
+/// Checks whether the given `buf` is padded with zeros.
+///
+/// To simplify the checking strategy, we just check the first
+/// and last byte in the `buf`.
+///
+/// In most common cases, the paddings will be filled with `0`,
+/// and several corner cases, where there exists corrupted blocks
+/// in the disk, might pass through this rule, but will failed in
+/// followed processing. So, we can just keep it simplistic.
+#[inline]
+pub(crate) fn is_zero_padded(buf: &[u8]) -> bool {
+    buf.is_empty() || (buf[0] == 0 && buf[buf.len() - 1] == 0)
+}
+
 /// `FileNameExt` offers file name formatting extensions to [`FileId`].
 pub trait FileNameExt: Sized {
     fn parse_file_name(file_name: &str) -> Option<Self>;
@@ -78,58 +92,106 @@ pub(super) fn lock_file_path<P: AsRef<Path>>(dir: P) -> PathBuf {
     path
 }
 
-/// In-memory representation of `Format` in log files.
-#[derive(Clone, Default)]
+/// Log file format. It will be encoded to file header.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
 pub struct LogFileFormat {
-    version: Version,
+    pub version: Version,
+    /// 0 stands for no alignment.
+    pub alignment: u64,
 }
 
 impl LogFileFormat {
+    pub fn new(version: Version, alignment: u64) -> Self {
+        Self { version, alignment }
+    }
+
     /// Length of header written on storage.
-    pub const fn len() -> usize {
+    const fn header_len() -> usize {
         LOG_FILE_MAGIC_HEADER.len() + std::mem::size_of::<Version>()
     }
 
-    pub fn from_version(version: Version) -> Self {
-        Self { version }
+    const fn payload_len(version: Version) -> usize {
+        match version {
+            Version::V1 => 0,
+            Version::V2 => std::mem::size_of::<u64>(),
+        }
     }
 
-    pub fn version(&self) -> Version {
-        self.version
+    pub const fn max_encoded_len() -> usize {
+        Self::header_len() + Self::payload_len(Version::V2)
+    }
+
+    /// Length of whole `LogFileFormat` written on storage.
+    pub fn encoded_len(version: Version) -> usize {
+        Self::header_len() + Self::payload_len(version)
     }
 
     /// Decodes a slice of bytes into a `LogFileFormat`.
     pub fn decode(buf: &mut &[u8]) -> Result<LogFileFormat> {
-        if buf.len() < Self::len() {
-            return Err(Error::Corruption("log file header too short".to_owned()));
-        }
+        let mut format = LogFileFormat::default();
         if !buf.starts_with(LOG_FILE_MAGIC_HEADER) {
             return Err(Error::Corruption(
                 "log file magic header mismatch".to_owned(),
             ));
         }
         buf.consume(LOG_FILE_MAGIC_HEADER.len());
-        let v = codec::decode_u64(buf)?;
-        if let Some(version) = Version::from_u64(v) {
-            Ok(Self { version })
+
+        let version_u64 = codec::decode_u64(buf)?;
+        if let Some(version) = Version::from_u64(version_u64) {
+            format.version = version;
         } else {
-            Err(Error::Corruption(format!(
+            return Err(Error::Corruption(format!(
                 "unrecognized log file version: {}",
-                v
-            )))
+                version_u64
+            )));
         }
+
+        let payload_len = Self::payload_len(format.version);
+        if buf.len() < payload_len {
+            return Err(Error::Corruption("missing header payload".to_owned()));
+        } else if payload_len > 0 {
+            format.alignment = codec::decode_u64(buf)?;
+        }
+
+        Ok(format)
     }
 
     /// Encodes this header and appends the bytes to the provided buffer.
     pub fn encode(&self, buf: &mut Vec<u8>) -> Result<()> {
         buf.extend_from_slice(LOG_FILE_MAGIC_HEADER);
         buf.encode_u64(self.version.to_u64().unwrap())?;
-        let corrupted = || {
-            fail::fail_point!("log_file_header::corrupted", |_| true);
-            false
-        };
-        if corrupted() {
-            buf[0] += 1;
+        if Self::payload_len(self.version) > 0 {
+            buf.encode_u64(self.alignment)?;
+        } else {
+            assert_eq!(self.alignment, 0);
+        }
+        #[cfg(feature = "failpoints")]
+        {
+            // Set header corrupted.
+            let corrupted = || {
+                fail::fail_point!("log_file_header::corrupted", |_| true);
+                false
+            };
+            // Set abnormal DataLayout.
+            let too_large = || {
+                fail::fail_point!("log_file_header::too_large", |_| true);
+                false
+            };
+            // Set corrupted DataLayout for `payload`.
+            let too_small = || {
+                fail::fail_point!("log_file_header::too_small", |_| true);
+                false
+            };
+            if corrupted() {
+                buf[0] += 1;
+            }
+            assert!(!(too_large() && too_small()));
+            if too_large() {
+                buf.encode_u64(0_u64)?;
+            }
+            if too_small() {
+                buf.pop();
+            }
         }
         Ok(())
     }
@@ -139,6 +201,27 @@ impl LogFileFormat {
 mod tests {
     use super::*;
     use crate::pipe_log::LogFileContext;
+    use crate::test_util::catch_unwind_silent;
+
+    #[test]
+    fn test_check_paddings_is_valid() {
+        // normal buffer
+        let mut buf = vec![0; 128];
+        // len < 8
+        assert!(is_zero_padded(&buf[0..6]));
+        // len == 8
+        assert!(is_zero_padded(&buf[120..]));
+        // len > 8
+        assert!(is_zero_padded(&buf));
+
+        // abnormal buffer
+        buf[127] = 3_u8;
+        assert!(is_zero_padded(&buf[0..110]));
+        assert!(is_zero_padded(&buf[120..125]));
+        assert!(!is_zero_padded(&buf[124..128]));
+        assert!(!is_zero_padded(&buf[120..]));
+        assert!(!is_zero_padded(&buf));
+    }
 
     #[test]
     fn test_file_name() {
@@ -173,13 +256,45 @@ mod tests {
     }
 
     #[test]
-    fn test_file_header() {
-        let header1 = LogFileFormat::default();
-        assert_eq!(header1.version().to_u64().unwrap(), 1);
-        let header2 = LogFileFormat::from_version(Version::default());
-        assert_eq!(header2.version().to_u64(), header1.version().to_u64());
-        let header3 = LogFileFormat::from_version(Version::default());
-        assert_eq!(header3.version(), header1.version());
+    fn test_encoding_decoding_file_format() {
+        fn enc_dec_file_format(file_format: LogFileFormat) -> Result<LogFileFormat> {
+            let mut buf = Vec::with_capacity(
+                LogFileFormat::header_len() + LogFileFormat::payload_len(file_format.version),
+            );
+            file_format.encode(&mut buf).unwrap();
+            LogFileFormat::decode(&mut &buf[..])
+        }
+        // header with aligned-sized data_layout
+        {
+            let mut buf = Vec::with_capacity(LogFileFormat::header_len());
+            let version = Version::V2;
+            let alignment = 4096;
+            buf.extend_from_slice(LOG_FILE_MAGIC_HEADER);
+            buf.encode_u64(version.to_u64().unwrap()).unwrap();
+            buf.encode_u64(alignment).unwrap();
+            assert_eq!(
+                LogFileFormat::decode(&mut &buf[..]).unwrap(),
+                LogFileFormat::new(version, alignment)
+            );
+        }
+        // header with abnormal version
+        {
+            let mut buf = Vec::with_capacity(LogFileFormat::header_len());
+            let abnormal_version = 4_u64; /* abnormal version */
+            buf.extend_from_slice(LOG_FILE_MAGIC_HEADER);
+            buf.encode_u64(abnormal_version).unwrap();
+            buf.encode_u64(16).unwrap();
+            assert!(LogFileFormat::decode(&mut &buf[..]).is_err());
+        }
+        {
+            let file_format = LogFileFormat::new(Version::default(), 0);
+            assert_eq!(
+                LogFileFormat::new(Version::default(), 0),
+                enc_dec_file_format(file_format).unwrap()
+            );
+            let file_format = LogFileFormat::new(Version::default(), 4096);
+            assert!(catch_unwind_silent(|| enc_dec_file_format(file_format)).is_err());
+        }
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub const GIB: u64 = MIB * BINARY_DATA_MAGNITUDE;
 pub const TIB: u64 = GIB * BINARY_DATA_MAGNITUDE;
 pub const PIB: u64 = TIB * BINARY_DATA_MAGNITUDE;
 
-#[derive(Clone, Debug, Copy, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Copy, PartialEq, Eq, PartialOrd)]
 pub struct ReadableSize(pub u64);
 
 impl ReadableSize {
@@ -325,6 +325,33 @@ pub trait Factory<Target>: Send + Sync {
     fn new_target(&self) -> Target;
 }
 
+/// Returns an aligned `offset`.
+///
+/// # Example:
+///
+/// ```ignore
+/// assert_eq!(round_up(18, 4), 20);
+/// assert_eq!(round_up(64, 16), 64);
+/// ```
+#[inline]
+pub fn round_up(offset: usize, alignment: usize) -> usize {
+    (offset + alignment - 1) / alignment * alignment
+}
+
+/// Returns an aligned `offset`.
+///
+/// # Example:
+///
+/// ```ignore
+/// assert_eq!(round_down(18, 4), 16);
+/// assert_eq!(round_down(64, 16), 64);
+/// ```
+#[allow(dead_code)]
+#[inline]
+pub fn round_down(offset: usize, alignment: usize) -> usize {
+    offset / alignment * alignment
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +461,17 @@ mod tests {
     #[test]
     fn test_unhash() {
         assert_eq!(unhash_u64(hash_u64(777)), 777);
+    }
+
+    #[test]
+    fn test_rounding() {
+        // round_up
+        assert_eq!(round_up(18, 4), 20);
+        assert_eq!(round_up(64, 16), 64);
+        assert_eq!(round_up(79, 4096), 4096);
+        // round_down
+        assert_eq!(round_down(18, 4), 16);
+        assert_eq!(round_down(64, 16), 64);
+        assert_eq!(round_down(79, 4096), 0);
     }
 }
